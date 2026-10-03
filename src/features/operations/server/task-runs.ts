@@ -1,4 +1,5 @@
 import { DomainError } from "#/lib/domain-error";
+import type { ReadDatabase } from "#/server/read-replica";
 
 const TASK_LEASE_MS = 30 * 60_000;
 
@@ -140,6 +141,41 @@ export async function runTrackedTask<T>(
 		});
 		throw error;
 	}
+}
+
+export type LatestOperationTaskRun = {
+	id: string;
+	task: string;
+	trigger: "manual" | "scheduled";
+	schedule: string | null;
+	status: "running" | "succeeded" | "failed";
+	started_at: number;
+	completed_at: number | null;
+	duration_ms: number | null;
+	error_code: string | null;
+};
+
+/**
+ * Newest run per requested task through one indexed seek each
+ * (`operation_task_runs_task_started_idx`) instead of ranking every run.
+ */
+export async function loadLatestOperationTaskRuns(
+	db: ReadDatabase,
+	tasks: readonly string[],
+) {
+	const rows = await db
+		.prepare(
+			`SELECT run.id, run.task, run.trigger, run.schedule, run.status, run.started_at,
+			 run.completed_at, run.duration_ms, run.error_code
+			 FROM json_each(?) AS requested
+			 JOIN operation_task_runs run ON run.id = (
+			  SELECT id FROM operation_task_runs INDEXED BY operation_task_runs_task_started_idx
+			  WHERE task = requested.value ORDER BY started_at DESC LIMIT 1
+			 )`,
+		)
+		.bind(JSON.stringify(tasks))
+		.all<LatestOperationTaskRun>();
+	return rows.results;
 }
 
 function logTaskRun(event: Record<string, unknown>) {

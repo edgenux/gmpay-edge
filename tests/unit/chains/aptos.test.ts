@@ -126,7 +126,7 @@ describe("Aptos adapter", () => {
 		});
 		expect(transactions).toHaveLength(101);
 		const secondBody = JSON.parse(
-			String((fetchMock.mock.calls[1]?.[1] as RequestInit).body),
+			String((fetchMock.mock.calls[1]?.[1] as RequestInit)?.body),
 		) as { variables: { offset: number } };
 		expect(secondBody.variables.offset).toBe(100);
 		expect(info).toHaveBeenCalledWith(
@@ -137,6 +137,35 @@ describe("Aptos adapter", () => {
 				requestCount: 2,
 				paginationRequestCount: 2,
 			}),
+		);
+	});
+	it("passes the time lower bound to the Indexer and truncates at the page budget", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(
+				graphql(
+					Array.from({ length: 100 }, (_, index) => activity(1_000 - index)),
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		const transactions = await new AptosAdapter({
+			indexerUrl: "https://api.mainnet.aptoslabs.com/v1/graphql",
+			maxPages: 1,
+			tokens: { USDT: { assetType, decimals: 6 } },
+		}).findTransactions({
+			address: owner,
+			assetCode: "USDT",
+			sinceTimestampMs: Date.UTC(2025, 5, 1),
+		});
+		expect(transactions).toHaveLength(100);
+		expect(transactions.truncated).toEqual({});
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		const body = JSON.parse(
+			String((fetchMock.mock.calls[0]?.[1] as RequestInit)?.body),
+		) as { query: string; variables: { sinceTimestamp: string } };
+		expect(body.variables.sinceTimestamp).toBe("2025-06-01T00:00:00.000Z");
+		expect(body.query).toContain(
+			"transaction_timestamp: { _gte: $sinceTimestamp }",
 		);
 	});
 	it("shares one deadline across all activity pages", async () => {

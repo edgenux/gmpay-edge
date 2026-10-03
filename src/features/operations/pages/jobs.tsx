@@ -1,5 +1,3 @@
-"use client";
-
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
 import { MoreHorizontal, Play } from "lucide-react";
@@ -17,6 +15,7 @@ import { operationsErrorMessage } from "#/features/operations/error-message";
 import {
 	formatScheduleInterval,
 	nextTaskExecutionAt,
+	RETENTION_INTERVAL_MS,
 	type ScheduledTaskName,
 	scheduledTaskCatalog,
 } from "#/features/operations/schedule";
@@ -187,9 +186,9 @@ function taskScheduleLabel(
 ) {
 	if (task === "payment_defaults") return null;
 	let intervalMs = 60_000;
+	if (task === "retention_cleanup") intervalMs = RETENTION_INTERVAL_MS;
 	if (task === "crypto_rate_sync") intervalMs = rateIntervalsMs.crypto;
 	if (task === "fiat_rate_sync") intervalMs = rateIntervalsMs.fiat;
-	if (task === "retention_cleanup") intervalMs = 86_400_000;
 	return m.jobs_schedule_every({
 		time: formatScheduleInterval(intervalMs, getLocale()),
 	});

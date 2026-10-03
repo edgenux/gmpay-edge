@@ -3,14 +3,19 @@ import { orderIdPathSchema } from "#/features/orders/schema";
 import { initializeOkPayOrder } from "#/features/orders/server/okpay-hosted";
 import { checkReceivingMethodReadiness } from "#/features/payment-settings/server/check-method-readiness";
 import {
+	createExchangeRateQuoter,
 	quoteUsdAmountMinor,
 	quoteWithExchangeRate,
 } from "#/features/payment-settings/server/rates";
-import { allocateUniqueReceivingMethodAndSnapshot } from "#/features/payment-settings/server/receiving-method-locks";
+import {
+	allocateUniqueReceivingMethodAndSnapshot,
+	ReceivingMethodUnavailableError,
+} from "#/features/payment-settings/server/receiving-method-locks";
 import { DomainError } from "#/lib/domain-error";
 import { decimalToUnits, unitsToDecimal } from "#/lib/money";
 import { minorToDecimal } from "#/lib/units";
 import { loadOperationalSettings } from "#/server/operational-settings";
+import type { ReadDatabase } from "#/server/read-replica";
 
 export const paymentOptionInput = z.object({
 	orderId: orderIdPathSchema,
@@ -44,7 +49,7 @@ type OrderForSelection = {
 };
 
 export async function listCheckoutPaymentOptions(
-	db: D1Database,
+	db: ReadDatabase,
 	orderId: string,
 ) {
 	const id = orderIdPathSchema.parse(orderId);
@@ -100,11 +105,13 @@ export async function listCheckoutPaymentOptions(
 		(method) =>
 			method.min_amount_minor !== null || method.max_amount_minor !== null,
 	);
+	const quoter = await createExchangeRateQuoter(db, {
+		amount: order.amount,
+		currency: order.currency,
+		paymentAssets: rows.results.map((asset) => asset.code),
+	});
 	const orderAmountUsdMinor = limitsRequireRate
-		? await quoteUsdAmountMinor(db, {
-				amount: order.amount,
-				currency: order.currency,
-			})
+		? quoter.usdAmountMinor()
 		: null;
 	const options = [];
 	let quoteUnavailable = false;
@@ -118,9 +125,7 @@ export async function listCheckoutPaymentOptions(
 		)
 			continue;
 		try {
-			const quote = await quoteWithExchangeRate(db, {
-				amount: order.amount,
-				currency: order.currency,
+			const quote = quoter.quote({
 				paymentAsset: asset.code,
 				assetDecimals: asset.decimals,
 			});
@@ -238,38 +243,50 @@ export async function selectCheckoutPaymentOption(
 		)
 	)
 		throw new PaymentOptionError("payment_option_unavailable", 409);
-	let paymentAmount = quote.paymentAmount;
 	const now = Date.now();
 	const settings = await loadOperationalSettings(db);
-	const allocation = await allocateUniqueReceivingMethodAndSnapshot(db, {
-		orderId: order.id,
-		receivingMethodId: method.id,
-		paymentMethodId: method.payment_method_id,
-		decimals: method.decimals,
-		expectedAmountUnits: decimalToUnits(
-			paymentAmount,
-			method.decimals,
-			"up",
-		).toString(),
-		...(orderAmountUsdMinor ? { orderAmountUsdMinor } : {}),
-		expiresAt: order.expires_at,
-		reusableAt: settings.immediateReleaseMode
-			? order.expires_at
-			: order.expires_at + settings.reorgMonitorMs,
-		immediateReleaseMode: settings.immediateReleaseMode,
-		now,
-		rate: {
-			source: quote.source,
-			raw: quote.rawRate,
-			adjustment: String(quote.adjustmentBps),
-			final: quote.finalRate,
-			observedAt: quote.observedAt,
-		},
-		existingOrder: {
-			expectedVersion: order.version,
-		},
-	});
-	paymentAmount = allocation.paymentAmount;
+	let paymentAmount: string;
+	try {
+		const allocation = await allocateUniqueReceivingMethodAndSnapshot(db, {
+			orderId: order.id,
+			receivingMethodId: method.id,
+			paymentMethodId: method.payment_method_id,
+			decimals: method.decimals,
+			expectedAmountUnits: decimalToUnits(
+				quote.paymentAmount,
+				method.decimals,
+				"up",
+			).toString(),
+			...(orderAmountUsdMinor ? { orderAmountUsdMinor } : {}),
+			expiresAt: order.expires_at,
+			reusableAt: settings.immediateReleaseMode
+				? order.expires_at
+				: order.expires_at + settings.reorgMonitorMs,
+			immediateReleaseMode: settings.immediateReleaseMode,
+			now,
+			rate: {
+				source: quote.source,
+				raw: quote.rawRate,
+				adjustment: String(quote.adjustmentBps),
+				final: quote.finalRate,
+				observedAt: quote.observedAt,
+			},
+			existingOrder: {
+				expectedVersion: order.version,
+			},
+		});
+		paymentAmount = allocation.paymentAmount;
+	} catch (error) {
+		if (!(error instanceof ReceivingMethodUnavailableError)) throw error;
+		throw new PaymentOptionError(
+			error.reason === "order_conflict"
+				? "order_unavailable"
+				: error.reason === "not_ready"
+					? "receiving_method_not_ready"
+					: "payment_option_unavailable",
+			409,
+		);
+	}
 	await db
 		.prepare(
 			`INSERT INTO audit_logs (id, action, target_type, target_id, before, after, created_at)
@@ -297,15 +314,20 @@ export async function selectCheckoutPaymentOption(
 		expiresAt: new Date(order.expires_at).toISOString(),
 	};
 	if (method.network === "okpay") {
-		await initializeOkPayOrder(db, result, {
-			externalOrderId: order.external_order_id,
-			amount: order.amount,
-			currency: order.currency,
-			paymentAsset: method.code,
-			paymentNetwork: method.network,
-			description: order.description ?? undefined,
-			returnUrl: order.return_url ?? undefined,
-		});
+		await initializeOkPayOrder(
+			db,
+			result,
+			{
+				externalOrderId: order.external_order_id,
+				amount: order.amount,
+				currency: order.currency,
+				paymentAsset: method.code,
+				paymentNetwork: method.network,
+				description: order.description ?? undefined,
+				returnUrl: order.return_url ?? undefined,
+			},
+			{ deleteOrder: false },
+		);
 	}
 	return selectedResult(order, method.code, method.network, paymentAmount);
 }
@@ -339,7 +361,7 @@ function selectedResult(
 	};
 }
 
-async function readOrder(db: D1Database, id: string) {
+async function readOrder(db: ReadDatabase, id: string) {
 	const row = await db
 		.prepare(
 			`SELECT o.id, o.external_order_id, o.status, o.amount_minor,

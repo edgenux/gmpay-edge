@@ -35,7 +35,6 @@ bun run deploy
 | 标签 | 推荐用途 |
 | --- | --- |
 | `latest` | 最新稳定版 |
-| `alpha` | 用于测试的最新预发布版 |
 | `1.0.0` | 用于可复现部署的固定版本 |
 
 #### Docker Compose
@@ -47,8 +46,9 @@ services:
   gmpay-edge:
     image: ghcr.io/gmwalletapp/gmpay-edge:latest
     restart: unless-stopped
+    # 明文 HTTP，供同一主机上的反向代理使用；参见“反向代理与 TLS”。
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GMPAY_DATA_DIR: /var/lib/gmpay
     volumes:
@@ -63,8 +63,6 @@ docker compose pull
 docker compose up -d
 ```
 
-需要测试预发布版时，启动前将 `latest` 改成 `alpha`。
-
 #### Docker 命令
 
 无法使用 Compose 时，可以直接运行容器：
@@ -72,11 +70,58 @@ docker compose up -d
 ```bash
 docker volume create gmpay-data
 docker run --detach --name gmpay-edge --restart unless-stopped \
-  --publish 3000:3000 \
+  --publish 127.0.0.1:3000:3000 \
   --env GMPAY_DATA_DIR=/var/lib/gmpay \
   --volume gmpay-data:/var/lib/gmpay \
   ghcr.io/gmwalletapp/gmpay-edge:latest
 ```
+
+#### 反向代理与 TLS
+
+容器只提供明文 HTTP，上面的示例也只把端口发布到宿主机的回环地址。生产流量必须经由
+同一主机或内网中终止 TLS 的反向代理进入，或者由 Bun 自身终止 TLS。
+
+GMPay Edge 以每个连接的 TCP 对端地址推导客户端地址。当对端是回环、私有或链路本地
+地址（`127.0.0.0/8`、`::1`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
+`169.254.0.0/16`、`fc00::/7`、`fe80::/10`）时，`X-Forwarded-For` 最右侧的一跳成为
+客户端地址，`X-Forwarded-Proto: https` 将请求标记为 HTTPS，从而启用 HSTS 与安全
+Cookie。来自其他对端的转发头一律丢弃，入站的 `cf-connecting-ip` 始终被覆盖，因此
+客户端无法伪造按 IP 的限流与审计记录。代理必须：
+
+- 保留原始 `Host` 头，Allowed Hosts 会校验它；
+- 将 `X-Forwarded-Proto` 设置为面向客户端的协议（覆盖而非追加）；
+- 把连接方地址追加到 `X-Forwarded-For`；
+- 当 Cloudflare 等 CDN 位于代理之前时，把真实客户端地址放在最右侧（例如 nginx 使用
+  `set_real_ip_from` 配置 CDN 网段并设置 `real_ip_header CF-Connecting-IP`），否则
+  所有访问者都会共享 CDN 地址。
+
+Caddy 默认满足以上全部要求：
+
+```caddyfile
+pay.example {
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+nginx：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+如需不经代理直接由 Bun 终止 TLS，将 `NITRO_SSL_CERT` 与 `NITRO_SSL_KEY` 指向 PEM
+文件路径（或 PEM 内容）并直接发布端口；此时所有对端都视为公网，其 socket 地址即
+客户端地址。
+
+`HOST`、`PORT` 和 `NODE_ENV` 是镜像内置的 Nitro 服务变量（`0.0.0.0`、`3000`、
+`production`），与 `NITRO_SSL_CERT`/`NITRO_SSL_KEY` 一样只影响监听方式。产品行为只由
+`GMPAY_DATA_DIR` 和需要登录的后台设置决定。
 
 #### 首次安装
 
@@ -108,7 +153,7 @@ docker compose up -d
 
 ## Cloudflare 资源
 
-- [ ] 在“后台 → 邮件配置”至少配置一个服务商。使用 Cloudflare Email 时，将 Email Routing 绑定为 `EMAIL` 并确认该 Workers 专用类型出现；实际发送找回邮件并确认 15 分钟链接可用。投递不可用时登录页仍统一返回通用响应。
+- [ ] 在“后台 → 邮件配置”至少配置一个服务商。使用 Cloudflare Email 时，将 Email Routing 绑定为 `EMAIL` 并确认该 Workers 专用类型出现；实际发送找回邮件并确认 15 分钟链接可用。投递不可用时登录页仍统一返回通用响应。SMTP 通道在 465 端口使用隐式 TLS；其他端口会先探测 `EHLO`，服务器未宣告 `STARTTLS` 时拒绝投递，凭据与邮件内容不会以明文传输，证书校验不可关闭。服务商支持时优先使用 465 端口。
 - [ ] 确认 Workers 构建创建或复用 `gmpay-edge` D1 数据库，并将其关联为 `DB`。
 - [ ] 完成一次构建，确认 Wrangler 的 `assets.directory` 发布 `dist/client`；静态文件由 Cloudflare 平台资产处理提供，不向应用代码暴露 `ASSETS` 绑定，应用和 API 路由继续进入 Worker。
 - [ ] 确认部署日志读取 `dist/server/wrangler.json`，其中 `main` 为 `index.js` 且 `no_bundle` 为 `true`；Wrangler 不得重新打包 `src/server-entry.ts`，也不得再出现 `#tanstack-router-entry` 或 `#tanstack-start-entry` 无法解析。
@@ -134,6 +179,23 @@ docker compose up -d
 - [ ] 按[支付配置](PAYMENT_METHODS.md)配置计划启用的支付方式；交易所只使用只读凭证，并核对资产标识和精度。
 - [ ] 配置加密资产与法币汇率同步；在各自设置弹窗中先执行一次“立即执行”，核对原始/最终汇率，再确认每分钟 Cron 遵循每类的自动同步开关和保存周期。
 
+## Cloudflare 上的延迟
+
+每条 D1 语句都是一次到数据库主区域的网络往返，因此 Workers 上的请求延迟取决于串行执行的语句数量，以及
+Worker 与 D1 之间的距离。已认证的管理端调用会并行执行 Allowed Hosts 设置读取与 Better Auth 会话查询，
+然后再执行自身查询；结账页只用一次汇率读取为全部支付选项报价。剩余差距由三项检查收敛：
+
+- **Smart Placement。** `wrangler.jsonc` 已启用，但 Cloudflare 需要观察到流量后才会生效。请在 Workers &
+  Pages → 该 Worker → Settings → Placement 中确认状态显示 Smart Placement 已激活，使 Worker 运行在 D1
+  主库附近。
+- **D1 读复制。** 在 D1 → 该数据库 → Settings → Read replication 中（或通过 REST API）为数据库启用一次。
+  之后列表、仪表盘、运营视图与结账读取会在一个可能由 Worker 附近副本提供服务的会话上执行；授权、设置与所有
+  写入仍走主库。变更请求的响应会设置 `gmpay_d1_bookmark` cookie（HttpOnly，五分钟），使同一浏览器随后的读取
+  至少锚定在该次写入之后。未启用读复制时该会话回落到主库，行为不变。
+- **先测量再调优。** 每个响应都带有 `Server-Timing` 响应头，包含 `authority`（设置读取）、`session`（Better
+  Auth 查询）、`rbac`（权限缓存）、`app` 与 `total`，单位为毫秒。结合 D1 指标页（查询延迟、读取行数）判断
+  对你的用户而言哪一段占主导，再决定是否更换区域或增加缓存。
+
 ## Bun 资源
 
 - [ ] 确认容器以非 root 用户运行，持久化目录仅允许预期的宿主机/容器身份写入。
@@ -145,18 +207,21 @@ docker compose up -d
 
 ## 自动发布
 
-semantic-release 会在两个发布通道的质量门通过后运行。`alpha` 从
-`1.0.0-alpha.1` 开始，只发布完整版本和滚动 `alpha` 容器标签；验证后合并到
-`main`，再发布稳定 `1.0.0` 以及 major、minor、`latest` 标签。它会更新
-`package.json` 和 `bun.lock`、创建带自动生成说明的 GitHub Release 与 tag，再调用
-独立的 Docker smoke 与多架构发布工作流。原生 x64 与 Arm64 runner 会并行构建并
-smoke 各自平台镜像，再组装发布 manifest。稳定镜像及其 provenance 发布成功后，
-匹配的 alpha GitHub 预发布记录、远程 Git tag 与 GHCR 镜像版本会自动删除。
+每次推送到 `main` 都会运行质量门；随后 semantic-release 按 Conventional Commits
+判断是否发布 `1.0.0` 这样的稳定版本，不存在预发布通道。发布会更新 `package.json`
+和 `bun.lock`、创建带自动生成说明的 GitHub Release 与 tag，再调用独立的 Docker
+smoke 与多架构发布工作流。原生 x64 与 Arm64 runner 会并行构建并 smoke 各自平台
+镜像，再组装发布 manifest，写入精确版本以及滚动的 major、minor 与 `latest` 标签。
+依赖范围均为 caret，因此发布步骤的 lockfile-only 安装只记录新的包版本，不会重新
+解析依赖。Pull Request 由 `CI` 工作流运行同一质量门。
 
 `gmpay-edge` GHCR Package 已公开；发布验收只需验证未登录拉取，无需再执行一次性
 可见性修改。
 
 ## 发布门槛
+
+`bun run typecheck` 会先生成 Paraglide 消息，因此该清单可在全新 clone 上复现；
+`CI` 工作流对每个 Pull Request 和 `main` 推送运行同样的五条命令。
 
 - [ ] `bun run typecheck`
 - [ ] `bun run test`

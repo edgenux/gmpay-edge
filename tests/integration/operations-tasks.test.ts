@@ -4,7 +4,10 @@ import {
 	type OperationsTask,
 	runOperationsTask,
 } from "#/features/operations/server/run-task";
-import { runTrackedTask } from "#/features/operations/server/task-runs";
+import {
+	loadLatestOperationTaskRuns,
+	runTrackedTask,
+} from "#/features/operations/server/task-runs";
 import { applyMigrations } from "./migrations";
 
 describe("manual operations tasks", () => {
@@ -248,6 +251,24 @@ describe("manual operations tasks", () => {
 		expect(runs.results).toEqual([{ status: "succeeded", count: 1 }]);
 	});
 
+	it("uses the task lease index when expiring stale runs", async () => {
+		const plan = await db
+			.prepare(
+				`EXPLAIN QUERY PLAN
+				 UPDATE operation_task_runs
+				 SET status = 'failed', completed_at = ?,
+				 duration_ms = MAX(0, ? - started_at),
+				 error_code = 'lease_expired'
+				 WHERE task = ? AND status = 'running' AND started_at <= ?`,
+			)
+			.bind(Date.now(), Date.now(), "lease-plan-test", Date.now())
+			.all<{ detail: string }>();
+
+		expect(plan.results.map(({ detail }) => detail).join("\n")).toContain(
+			"operation_task_runs_task_status_started_idx",
+		);
+	});
+
 	it("expires a stale task lease atomically before starting its replacement", async () => {
 		const now = Date.now();
 		const staleStartedAt = now - 30 * 60_000 - 1;
@@ -293,6 +314,40 @@ describe("manual operations tasks", () => {
 			status: "succeeded",
 			error_code: null,
 		});
+	});
+
+	it("reads the newest run per task through one indexed seek each", async () => {
+		const base = 5_000_000_000_000;
+		await db.batch([
+			db
+				.prepare(
+					`INSERT INTO operation_task_runs (id, task, trigger, status, started_at, completed_at, duration_ms, error_code)
+					 VALUES ('latest-a-old', 'latest-task-a', 'scheduled', 'succeeded', ?, ?, 1, NULL),
+					 ('latest-a-new', 'latest-task-a', 'manual', 'failed', ?, ?, 2, 'task_failed'),
+					 ('latest-b', 'latest-task-b', 'scheduled', 'running', ?, NULL, NULL, NULL)`,
+				)
+				.bind(base, base + 1, base + 10, base + 12, base + 20),
+		]);
+
+		const runs = await loadLatestOperationTaskRuns(db, [
+			"latest-task-a",
+			"latest-task-b",
+			"latest-task-missing",
+		]);
+		expect(runs.map(({ id, task, status }) => ({ id, task, status }))).toEqual([
+			{ id: "latest-a-new", task: "latest-task-a", status: "failed" },
+			{ id: "latest-b", task: "latest-task-b", status: "running" },
+		]);
+		const plan = await db
+			.prepare(
+				`EXPLAIN QUERY PLAN SELECT id FROM operation_task_runs
+				 INDEXED BY operation_task_runs_task_started_idx
+				 WHERE task = 'latest-task-a' ORDER BY started_at DESC LIMIT 1`,
+			)
+			.all<{ detail: string }>();
+		const details = plan.results.map(({ detail }) => detail).join("\n");
+		expect(details).toContain("operation_task_runs_task_started_idx (task=?)");
+		expect(details).not.toContain("USE TEMP B-TREE");
 	});
 
 	it("emits bounded structured task lifecycle records", async () => {

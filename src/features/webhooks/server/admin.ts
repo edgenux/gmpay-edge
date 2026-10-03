@@ -11,13 +11,15 @@ import { loadInboundWebhookReceipt } from "#/features/webhooks/server/inbound-ad
 import { inboundWebhookCatalogEndpoints } from "#/features/webhooks/server/inbound-receipts";
 import {
 	claimManualWebhookRetry,
-	completeManualWebhookRetry,
+	isManuallyRetryableWebhookDelivery,
 	releaseManualWebhookRetry,
 	requireRetryableWebhookDelivery,
 } from "#/features/webhooks/server/retry";
 import type { WebhookQueueMessage } from "#/features/webhooks/types";
 import { DomainError } from "#/lib/domain-error";
 import { getCloudflareEnv } from "#/server/db.server";
+import { requestId } from "#/server/http";
+import { readDatabase } from "#/server/read-replica";
 
 const webhookListSchema = z.object({
 	pageIndex: z.number().int().min(0).default(0),
@@ -29,7 +31,7 @@ const webhookListSchema = z.object({
 export const listInboundWebhookEndpointsFn = createServerFn({
 	method: "GET",
 }).handler(async () => {
-	const { db } = await adminContext(
+	const { readDb: db } = await adminContext(
 		systemPermission("webhooks", "read"),
 		"webhook_inbound_unavailable",
 	);
@@ -60,7 +62,7 @@ export const listInboundWebhookEndpointsFn = createServerFn({
 export const listInboundWebhookReceiptsFn = createServerFn({ method: "GET" })
 	.validator((input) => webhookListSchema.parse(input))
 	.handler(async ({ data }) => {
-		const { db } = await adminContext(
+		const { readDb: db } = await adminContext(
 			systemPermission("webhooks", "read"),
 			"webhook_inbound_unavailable",
 		);
@@ -131,7 +133,7 @@ export const listInboundWebhookReceiptsFn = createServerFn({ method: "GET" })
 export const getInboundWebhookReceiptFn = createServerFn({ method: "GET" })
 	.validator((input: { id: string }) => z.object({ id: z.uuid() }).parse(input))
 	.handler(async ({ data }) => {
-		const { db } = await adminContext(
+		const { readDb: db } = await adminContext(
 			systemPermission("webhooks", "read"),
 			"webhook_inbound_unavailable",
 		);
@@ -141,7 +143,9 @@ export const getInboundWebhookReceiptFn = createServerFn({ method: "GET" })
 export const listAdminWebhooksFn = createServerFn({ method: "GET" })
 	.validator((input) => webhookListSchema.parse(input))
 	.handler(async ({ data }) => {
-		const { db } = await adminContext(systemPermission("webhooks", "read"));
+		const { readDb: db } = await adminContext(
+			systemPermission("webhooks", "read"),
+		);
 		const search = data.search ? `%${data.search}%` : null;
 		const filters: string[] = [];
 		const parameters: Array<string | number> = [];
@@ -155,6 +159,7 @@ export const listAdminWebhooksFn = createServerFn({ method: "GET" })
 		}
 		const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
 		const offset = data.pageIndex * data.pageSize;
+		const now = Date.now();
 		const [countResult, rowsResult] = await db.batch([
 			db
 				.prepare(
@@ -200,6 +205,7 @@ export const listAdminWebhooksFn = createServerFn({ method: "GET" })
 				url: row.url,
 				status: row.status,
 				attemptCount: row.attempt_count,
+				retryable: isManuallyRetryableWebhookDelivery(row, now),
 				responseStatus: row.response_status,
 				durationMs: row.duration_ms,
 				errorCode: row.error_code,
@@ -221,7 +227,9 @@ export const listAdminWebhooksFn = createServerFn({ method: "GET" })
 export const getAdminWebhookDeliveryFn = createServerFn({ method: "GET" })
 	.validator((input: { id: string }) => z.object({ id: z.uuid() }).parse(input))
 	.handler(async ({ data }) => {
-		const { db } = await adminContext(systemPermission("webhooks", "read"));
+		const { readDb: db } = await adminContext(
+			systemPermission("webhooks", "read"),
+		);
 		return loadAdminWebhookDelivery(db, data.id);
 	});
 
@@ -237,36 +245,35 @@ export const retryWebhookDeliveryFn = createServerFn({ method: "POST" })
 				503,
 				"Webhook queue is unavailable",
 			);
+		const now = Date.now();
 		const row = await db
-			.prepare(`SELECT d.id, d.status, d.attempt_count, e.id AS event_id
+			.prepare(`SELECT d.id, d.status, d.attempt_count, d.next_attempt_at, e.id AS event_id
 			FROM webhook_deliveries d JOIN webhook_events e ON e.id = d.event_id WHERE d.id = ? LIMIT 1`)
 			.bind(data.id)
 			.first<{
 				id: string;
 				status: "failed" | "dead" | "queued" | "delivering" | "succeeded";
 				attempt_count: number;
+				next_attempt_at: number | null;
 				event_id: string;
 			}>();
-		requireRetryableWebhookDelivery(row);
-		const now = Date.now();
-		const claimToken =
-			-Number.parseInt(crypto.randomUUID().slice(0, 8), 16) - 1;
-		if (!(await claimManualWebhookRetry(db, data.id, claimToken, now)))
+		requireRetryableWebhookDelivery(row, now);
+		if (!(await claimManualWebhookRetry(db, data.id, row.attempt_count, now)))
 			throw new DomainError(
 				"webhook_delivery_retry_in_progress",
 				409,
 				"Webhook delivery retry is already in progress",
 			);
+		// The manual attempt continues the numbering so earlier attempt rows stay.
 		const message: WebhookQueueMessage = {
 			kind: "webhook.delivery",
 			version: 1,
 			deliveryId: data.id,
 			eventId: row.event_id,
-			attempt: 1,
+			attempt: row.attempt_count + 1,
 		};
 		try {
 			await env.WEBHOOK_QUEUE.send(message);
-			await completeManualWebhookRetry(db, data.id, claimToken);
 			await db
 				.prepare(`INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id,
 				request_id, ip_address, created_at) VALUES (?, ?, 'webhook.delivery_retried', 'webhook_delivery', ?, ?, ?, ?)`)
@@ -274,16 +281,13 @@ export const retryWebhookDeliveryFn = createServerFn({ method: "POST" })
 					crypto.randomUUID(),
 					user.id,
 					data.id,
-					request.headers.get("x-request-id"),
+					requestId(request),
 					request.headers.get("cf-connecting-ip"),
 					now,
 				)
 				.run();
 		} catch (error) {
-			await releaseManualWebhookRetry(db, data.id, claimToken, {
-				status: row.status,
-				attemptCount: row.attempt_count,
-			});
+			await releaseManualWebhookRetry(db, data.id, row.attempt_count, now);
 			throw error;
 		}
 		return { id: data.id, status: "queued" as const };
@@ -303,5 +307,11 @@ async function adminContext(
 			"Inbound webhook storage is unavailable",
 		);
 	if (!env.DB) throw new Error("D1 binding DB is unavailable");
-	return { db: env.DB, env, request, user };
+	return {
+		db: env.DB,
+		readDb: readDatabase(request, env.DB),
+		env,
+		request,
+		user,
+	};
 }

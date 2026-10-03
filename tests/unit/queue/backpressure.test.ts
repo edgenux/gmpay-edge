@@ -67,25 +67,30 @@ describe("Queue invocation backpressure", () => {
 		["gmpay-edge-payments", "payment", 10, 2],
 		["gmpay-edge-webhooks", "webhook", 1, 1],
 		["gmpay-edge-webhooks", "webhook", 10, 5],
-	] as const)("bounds %s %s traffic with %i messages at %i active consumers", async (queue, kind, count, expectedPeak) => {
-		execution.delayMs = 5;
-		const messages = Array.from({ length: count }, (_, index) =>
-			kind === "payment" ? paymentMessage(index) : webhookMessage(index),
-		);
+	] as const)(
+		"bounds %s %s traffic with %i messages at %i active consumers",
+		async (queue, kind, count, expectedPeak) => {
+			execution.delayMs = 5;
+			const messages = Array.from({ length: count }, (_, index) =>
+				kind === "payment" ? paymentMessage(index) : webhookMessage(index),
+			);
 
-		await handleQueue(
-			{ queue, messages } as unknown as Parameters<typeof handleQueue>[0],
-			{ DB: {} as D1Database } as Env,
-		);
+			await handleQueue(
+				{ queue, messages } as unknown as Parameters<typeof handleQueue>[0],
+				{ DB: {} as D1Database } as Env,
+			);
 
-		expect(execution.maximum).toBe(expectedPeak);
-		expect(messages.every(({ ack }) => ack.mock.calls.length === 1)).toBe(true);
-		expect(queueMocks.loadRuntimeConfig).toHaveBeenCalledOnce();
-		expect(queueMocks.loadOperationalSettings).toHaveBeenCalledTimes(
-			kind === "webhook" ? 1 : 0,
-		);
-		if (kind === "payment") expect(execution.adapterCaches.size).toBe(1);
-	});
+			expect(execution.maximum).toBe(expectedPeak);
+			expect(messages.every(({ ack }) => ack.mock.calls.length === 1)).toBe(
+				true,
+			);
+			expect(queueMocks.loadRuntimeConfig).toHaveBeenCalledOnce();
+			expect(queueMocks.loadOperationalSettings).toHaveBeenCalledTimes(
+				kind === "webhook" ? 1 : 0,
+			);
+			if (kind === "payment") expect(execution.adapterCaches.size).toBe(1);
+		},
+	);
 
 	it("merges a duplicate payment burst and propagates one retry to every original message", async () => {
 		const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -131,6 +136,9 @@ describe("Queue invocation backpressure", () => {
 			webhookMessage(index, Date.now() - 200),
 		);
 		const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+		const error = vi
+			.spyOn(console, "error")
+			.mockImplementation(() => undefined);
 
 		try {
 			await handleQueue(
@@ -157,8 +165,24 @@ describe("Queue invocation backpressure", () => {
 			});
 			expect(record.oldestMessageAgeMs).toBeGreaterThanOrEqual(190);
 			expect(record.durationMs).toBeGreaterThanOrEqual(8);
+			// The failure is identifiable without the body or the error text.
+			expect(error).toHaveBeenCalledOnce();
+			const failure = JSON.parse(String(error.mock.calls[0]?.[0]));
+			expect(failure).toEqual({
+				event: "queue_message_failed",
+				invocationId: record.invocationId,
+				queue: "gmpay-edge-webhooks",
+				messageId: "webhook-1",
+				kind: "webhook",
+				errorName: "Error",
+			});
+			expect(String(error.mock.calls[0]?.[0])).not.toContain("delivery-1");
+			expect(String(error.mock.calls[0]?.[0])).not.toContain(
+				"deterministic consumer failure",
+			);
 		} finally {
 			info.mockRestore();
+			error.mockRestore();
 		}
 	});
 

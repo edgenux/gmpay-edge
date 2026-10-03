@@ -4,6 +4,26 @@ import {
 	recoverWebhookOutbox,
 } from "#/features/webhooks/server/outbox";
 import { DomainError } from "#/lib/domain-error";
+import type { ReadDatabase } from "#/server/read-replica";
+
+/**
+ * Dead-lettered messages of the Bun durable queue by queue name. Cloudflare
+ * dead letters live in the DLQ outside D1, so the count is unavailable there.
+ */
+export async function loadDeadQueueMessageCounts(db: ReadDatabase) {
+	const table = await db
+		.prepare(
+			"SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'node_queue_messages' LIMIT 1",
+		)
+		.first<{ present: number }>();
+	if (!table) return null;
+	const rows = await db
+		.prepare(
+			"SELECT queue, COUNT(*) AS count FROM node_queue_messages WHERE status = 'dead' GROUP BY queue",
+		)
+		.all<{ queue: string; count: number }>();
+	return new Map(rows.results.map((row) => [row.queue, row.count]));
+}
 
 export async function retryQueueWorkload(
 	env: Env,
